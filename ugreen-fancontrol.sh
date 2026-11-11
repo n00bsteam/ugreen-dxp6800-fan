@@ -17,11 +17,13 @@
 set -uo pipefail
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-INTERVAL=20
+INTERVAL="${FAN_INTERVAL:-20}"
 PWM_MIN=80                 # ~31 %: below this the NF-A9 stops moving useful air
 PWM_MAX=255
 CASE_CHANNELS=(3 4)
 INCLUDE_NVME=0             # on this box NVMe stays ~5 C cooler than the HDDs
+CRITICAL_TEMP="${FAN_CRITICAL_TEMP:-62}"  # at/above this: 100 % regardless of curve
+STALL_LIMIT=3              # consecutive no-tach samples while driving -> 100 %
 
 # drive temp(C):pwm   (255 = 100 %, 128 = 50 %, 80 = 31 %)
 # 55 C -> ~1360 rpm (barely audible), 57 C -> ~1500 rpm, 60 C -> ~1900 rpm.
@@ -117,6 +119,18 @@ restore_auto() {
   done
 }
 
+# True if at least one case fan reports a non-zero tach.  A fan that is
+# disconnected or has seized reads 0 even though the PWM is being driven.
+any_fan_running() {
+  local ch rpm
+  for ch in "${CASE_CHANNELS[@]}"; do
+    rpm="$(read_sysfs "$HWMON/fan${ch}_input" 2>/dev/null || true)"
+    case "$rpm" in ''|*[!0-9]*) continue ;; esac
+    [ "$rpm" -gt 0 ] && return 0
+  done
+  return 1
+}
+
 # --- single instance -------------------------------------------------------
 if [ -f "$PIDFILE" ]; then
   other="$(read_sysfs "$PIDFILE" || true)"
@@ -175,7 +189,7 @@ if ! setup_timer; then
   exit 1
 fi
 
-last_pwm=""; last_t=""; iter=0
+last_pwm=""; last_t=""; iter=0; stalls=0; stall_logged=0
 while :; do
   iter=$((iter + 1))
   T="$(read_drive_temp || true)"
@@ -187,6 +201,28 @@ while :; do
   PWM="$(pwm_for_temp "$T" "${CASE_CURVE[@]}")"
   [ "$PWM" -lt "$PWM_MIN" ] && PWM="$PWM_MIN"
   [ "$PWM" -gt "$PWM_MAX" ] && PWM="$PWM_MAX"
+  # Explicit critical clamp: above this the curve is irrelevant.
+  [ "$T" -ge "$CRITICAL_TEMP" ] && PWM="$PWM_MAX"
+
+  force=0
+  # Tach watchdog: PWM is being driven but neither fan reports any rotation.
+  if any_fan_running; then
+    stalls=0
+    if [ "$stall_logged" = 1 ]; then
+      log "fans spinning again — back to the curve"
+      stall_logged=0
+    fi
+  else
+    stalls=$((stalls + 1))
+  fi
+  if [ "$stalls" -ge "$STALL_LIMIT" ]; then
+    PWM="$PWM_MAX"
+    force=1
+    if [ "$stall_logged" = 0 ]; then
+      log "WARN: no tach on fan3/fan4 while driving — forcing 100 %"
+      stall_logged=1
+    fi
+  fi
 
   apply=0
   # Re-assert manual mode every 5 minutes even if nothing changed: the EC has
@@ -199,6 +235,7 @@ while :; do
     dp=$(( PWM > last_pwm ? PWM - last_pwm : last_pwm - PWM ))
     if [ "$dt" -ge 2 ] || [ "$dp" -ge 24 ]; then apply=1; fi
   fi
+  [ "$force" = 1 ] && apply=1
 
   if [ "$apply" = 1 ]; then
     for ch in "${CASE_CHANNELS[@]}"; do

@@ -29,6 +29,11 @@ It is deliberately small: a shell daemon reading sysfs, no `lm-sensors`, no
   to `PWM_MIN..255` (`PWM_MIN=80`, ≈31 %, because below that the NF-A9 stops
   moving useful air).
 - A 2 °C / 24-count deadband stops the fans from hunting.
+- Tach watchdog: if the PWM is being driven but neither case fan reports any
+  rotation for three samples in a row, both go to 100 % and the event is logged;
+  normal control resumes when the tach comes back.
+- Critical clamp: at or above `CRITICAL_TEMP` (62 °C) the fans go to 100 %
+  regardless of the curve.
 - Manual mode is re-asserted every 5 minutes even if nothing changed — the EC
   has been seen to drop a channel back to automatic on its own.
 - Fail-safe: if the drive temperature cannot be read, the fans go to 100 %.
