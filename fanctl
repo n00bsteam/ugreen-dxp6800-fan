@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+#
+# fanctl — helper for ugreen-fancontrol.sh on UGREEN DXP6800 Pro / TrueNAS SCALE
+#
+#   fanctl start      load driver if needed, start the fan loop
+#   fanctl stop       stop it and hand both case channels back to the chip
+#   fanctl restart    stop then start
+#   fanctl status     running state, pwm mode/value, rpm, log tail
+#   fanctl temps      one-shot temps + rpm
+#   fanctl set PWM    force both case fans to a fixed duty (80-255)
+#   fanctl diagnose   module, hwmon, writability, chip detection
+#   fanctl log        follow the log
+#
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)"
+FAN_SCRIPT="${FAN_SCRIPT:-$HERE/ugreen-fancontrol.sh}"
+MODULE="${IT87_MODULE:-$HERE/it87.ko}"
+PIDFILE="${FAN_PIDFILE:-/var/run/ugreen-fancontrol.pid}"
+LOGFILE="${FAN_LOG:-/var/log/ugreen-fancontrol.log}"
+
+if [ "$(id -u)" -ne 0 ]; then exec sudo "$0" "$@"; fi
+
+hwmon_name() {
+  local n=""
+  [ -r "$1/name" ] && n="$(tr -d '\n' < "$1/name" 2>/dev/null || true)"
+  echo "$n"
+}
+
+find_hwmon() {
+  local d
+  for d in /sys/class/hwmon/hwmon*; do
+    [ -d "$d" ] || continue
+    [ "$(hwmon_name "$d")" = "it8613" ] && { echo "$d"; return 0; }
+  done
+  return 1
+}
+
+module_loaded() { grep -q '^it87 ' /proc/modules 2>/dev/null; }
+
+load_module() {
+  module_loaded && return 0
+  modprobe hwmon-vid 2>/dev/null || modprobe hwmon_vid 2>/dev/null || true
+  [ -f "$MODULE" ] || { echo "ERROR: $MODULE missing" >&2; return 1; }
+  insmod "$MODULE" 2>/dev/null || true
+  sleep 1
+  module_loaded
+}
+
+restore_auto() {
+  local hw ch
+  hw="$(find_hwmon || true)"
+  [ -n "$hw" ] || return 0
+  for ch in 3 4; do
+    printf '2\n' > "$hw/pwm${ch}_enable" 2>/dev/null || true
+  done
+}
+
+is_daemon() {
+  local p="$1"
+  local -a args=()
+  [ -n "$p" ] && [ -r "/proc/$p/cmdline" ] || return 1
+  mapfile -d '' -t args < "/proc/$p/cmdline" 2>/dev/null || return 1
+  [ "${args[1]:-}" = "$FAN_SCRIPT" ] || [ "${args[0]:-}" = "$FAN_SCRIPT" ]
+}
+
+running_pid() {
+  local p
+  if [ -f "$PIDFILE" ]; then
+    p="$(tr -d '\n' < "$PIDFILE" 2>/dev/null || true)"
+    if [ -n "${p:-}" ] && is_daemon "$p"; then echo "$p"; return 0; fi
+  fi
+  # pgrep alone is not enough: any shell whose command line mentions the
+  # script path (e.g. an admin running `fanctl restart`) matches too.
+  for p in $(pgrep -f "$FAN_SCRIPT" 2>/dev/null || true); do
+    is_daemon "$p" && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
+milli_to_c() {
+  local m="$1"
+  case "$m" in ''|*[!0-9]*) echo "?"; return ;; esac
+  echo $(( m / 1000 ))
+}
+
+cmd_start() {
+  if pid="$(running_pid)"; then echo "already running (pid $pid)"; return 0; fi
+  [ -x "$FAN_SCRIPT" ] || { echo "ERROR: $FAN_SCRIPT missing or not executable" >&2; exit 1; }
+  if ! load_module; then
+    echo "ERROR: it87 module not loaded and could not be insmod'ed from $MODULE" >&2
+    exit 1
+  fi
+  find_hwmon >/dev/null || { echo "ERROR: it8613 hwmon not present after loading module" >&2; exit 1; }
+  mkdir -p "$(dirname "$LOGFILE")"
+  touch "$LOGFILE"
+  nohup "$FAN_SCRIPT" >> "$LOGFILE" 2>&1 &
+  sleep 2
+  if pid="$(running_pid)"; then
+    echo "started (pid $pid)"
+    echo "log: $LOGFILE"
+  else
+    echo "ERROR: failed to start — last log lines:" >&2
+    tail -n 15 "$LOGFILE" 2>/dev/null || true
+    exit 1
+  fi
+}
+
+cmd_stop() {
+  if pid="$(running_pid)"; then
+    kill -TERM "$pid" 2>/dev/null || true
+    local i=0
+    while [ "$i" -lt 25 ]; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.2
+      i=$(( i + 1 ))
+    done
+    kill -0 "$pid" 2>/dev/null && echo "WARN: still alive after TERM" || echo "stopped (pid $pid)"
+  else
+    echo "not running"
+  fi
+  restore_auto
+  echo "case fans handed back to the chip (auto)"
+  : > "$PIDFILE" 2>/dev/null || true
+}
+
+cmd_status() {
+  if pid="$(running_pid)"; then echo "STATUS : running (pid $pid)"; else echo "STATUS : stopped"; fi
+  echo "SCRIPT : $FAN_SCRIPT"
+  echo "MODULE : $(module_loaded && echo loaded || echo 'not loaded')"
+  local hw
+  hw="$(find_hwmon || true)"
+  if [ -n "$hw" ]; then
+    echo "it8613 : $hw"
+    local ch en pwm mode
+    for ch in 2 3 4; do
+      en="$(tr -d '\n' < "$hw/pwm${ch}_enable" 2>/dev/null || echo '?')"
+      pwm="$(tr -d '\n' < "$hw/pwm${ch}" 2>/dev/null || echo '?')"
+      case "$en" in 1) mode="manual" ;; 2) mode="auto" ;; 0) mode="full" ;; *) mode="mode${en}" ;; esac
+      printf 'pwm%s   : %-6s value=%-3s fan=%s RPM\n' "$ch" "$mode" "$pwm" \
+        "$(tr -d '\n' < "$hw/fan${ch}_input" 2>/dev/null || echo '?')"
+    done
+    echo "temps  : CPU(PECI)=$(milli_to_c "$(cat "$hw/temp1_input")")C  case=$(milli_to_c "$(cat "$hw/temp2_input")")C"
+  else
+    echo "it8613 : not found (module not loaded?)"
+  fi
+  [ -f "$LOGFILE" ] && { echo "--- log ---"; tail -n 5 "$LOGFILE"; }
+}
+
+cmd_temps() {
+  load_module >/dev/null 2>&1 || true
+  echo "--- drives ---"
+  local d name t max=0
+  for d in /sys/class/hwmon/hwmon*; do
+    [ -d "$d" ] || continue
+    name="$(hwmon_name "$d")"
+    case "$name" in
+      drivetemp)
+        t="$(milli_to_c "$(tr -d '\n' < "$d/temp1_input" 2>/dev/null || echo)")"
+        echo "  HDD $(basename "$d") : ${t} C"
+        case "$t" in *[0-9]*) [ "$t" -gt "$max" ] && max="$t" ;; esac
+        ;;
+      nvme)
+        t="$(milli_to_c "$(tr -d '\n' < "$d/temp1_input" 2>/dev/null || echo)")"
+        echo "  NVMe $(basename "$d"): ${t} C (composite)"
+        ;;
+      coretemp)
+        t="$(milli_to_c "$(tr -d '\n' < "$d/temp1_input" 2>/dev/null || echo)")"
+        echo "  CPU  $(basename "$d") : ${t} C (package)"
+        ;;
+    esac
+  done
+  echo "hottest drive: ${max:-?} C"
+  local hw
+  hw="$(find_hwmon || true)"
+  if [ -n "$hw" ]; then
+    echo "--- fans ---"
+    echo "fan2 (CPU)   : $(cat "$hw/fan2_input" 2>/dev/null || echo '?') RPM  pwm2=$(cat "$hw/pwm2" 2>/dev/null)/$(cat "$hw/pwm2_enable" 2>/dev/null)"
+    echo "fan3 (right) : $(cat "$hw/fan3_input" 2>/dev/null || echo '?') RPM  pwm3=$(cat "$hw/pwm3" 2>/dev/null)/$(cat "$hw/pwm3_enable" 2>/dev/null)"
+    echo "fan4 (left)  : $(cat "$hw/fan4_input" 2>/dev/null || echo '?') RPM  pwm4=$(cat "$hw/pwm4" 2>/dev/null)/$(cat "$hw/pwm4_enable" 2>/dev/null)"
+  else
+    echo "it8613 not loaded — cannot read RPM"
+  fi
+}
+
+cmd_diagnose() {
+  echo "=== kernel ==="; uname -r
+  echo "=== modules ==="; grep -E '^(it87|hwmon_vid) ' /proc/modules || echo "(not loaded)"
+  echo "=== modinfo of payload ==="; [ -f "$MODULE" ] && modinfo "$MODULE" 2>/dev/null | grep -E '^(vermagic|filename)' || echo "missing $MODULE"
+  echo "=== hwmon ==="
+  local d
+  for d in /sys/class/hwmon/hwmon*; do
+    [ -d "$d" ] || continue
+    printf '%s name=%s' "$d" "$(hwmon_name "$d")"
+    [ -e "$d/pwm3" ] && printf ' pwm3=%s' "$(cat "$d/pwm3")"
+    [ -e "$d/pwm4" ] && printf ' pwm4=%s' "$(cat "$d/pwm4")"
+    echo
+  done
+  local hw
+  hw="$(find_hwmon || true)"
+  if [ -n "$hw" ]; then
+    echo "=== writability ==="
+    for f in pwm3 pwm4 pwm3_enable pwm4_enable; do
+      [ -w "$hw/$f" ] && echo "writable     $hw/$f" || echo "NOT writable $hw/$f"
+    done
+  fi
+}
+
+cmd_set() {
+  local val="${1:-}" hw ch
+  case "$val" in ''|*[!0-9]*) echo "usage: fanctl set <pwm 80-255>" >&2; exit 2 ;; esac
+  if [ "$val" -lt 80 ] || [ "$val" -gt 255 ]; then
+    echo "ERROR: pwm must be 80..255 (below 80 the NF-A9 stalls)" >&2
+    exit 2
+  fi
+  hw="$(find_hwmon || true)"
+  [ -n "$hw" ] || { echo "ERROR: it8613 not found (module loaded?)" >&2; exit 1; }
+  for ch in 3 4; do
+    printf '1\n' > "$hw/pwm${ch}_enable" 2>/dev/null || true
+    printf '%s\n' "$val" > "$hw/pwm${ch}" 2>/dev/null || true
+  done
+  echo "pwm3/pwm4 = $val ($(( val * 100 / 255 ))%), $(cat "$hw/fan3_input" 2>/dev/null || echo '?') / $(cat "$hw/fan4_input" 2>/dev/null || echo '?') RPM"
+  echo "note: a running daemon will override this on its next update — use 'fanctl stop' first"
+}
+
+cmd_log() { tail -f "$LOGFILE"; }
+
+case "${1:-status}" in
+  start)     cmd_start ;;
+  stop)      cmd_stop ;;
+  restart)   cmd_stop; sleep 1; cmd_start ;;
+  status)    cmd_status ;;
+  temps)     cmd_temps ;;
+  set)       cmd_set "${2:-}" ;;
+  diagnose|diag) cmd_diagnose ;;
+  log)       cmd_log ;;
+  *) echo "usage: fanctl {start|stop|restart|status|temps|set <pwm>|diagnose|log}" >&2; exit 2 ;;
+esac

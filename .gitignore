@@ -1,0 +1,24 @@
+# local / instance-specific things that must never be published
+.ssh/
+.reference/
+.build/
+.driver-src/
+src/
+
+# build artefacts
+*.ko
+*.o
+*.mod
+*.mod.c
+*.cmd
+modules.order
+Module.symvers
+VERSION
+it87.ko
+
+# runtime
+*.log
+*.pid
+*.fifo
+
+.DS_Store
